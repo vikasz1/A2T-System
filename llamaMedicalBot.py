@@ -172,8 +172,12 @@ def tool_recall_memory(query: str) -> dict:
         return {"turns": [], "error": str(e)}
 
 
+# Module-level cache so the SQL validator can access real column names
+_schema_cache: dict = {}   # {table_name: [col_name, ...]}
+
 def tool_discover_schema() -> dict:
     """Inspect all tables in the SQLite database and return schema + sample rows."""
+    global _schema_cache
     if not Path(DB_PATH).exists():
         return {"error": f"Database {DB_PATH} not found.", "schema_text": ""}
     conn = sqlite3.connect(DB_PATH)
@@ -195,8 +199,10 @@ def tool_discover_schema() -> dict:
             cur.execute(f"SELECT * FROM {table} LIMIT {MAX_SAMPLE_ROWS}")
             sample = [dict(r) for r in cur.fetchall()]
         schema[table] = {"columns": cols, "sample_rows": sample, "row_count": rc}
+        # Populate cache: lowercase lookup → real name for validation
+        _schema_cache[table] = [c["name"] for c in cols]
     conn.close()
-    # Compact text representation
+    # Compact text for the LLM — show exact names, backtick-quoted
     lines = []
     for table, info in schema.items():
         parts = []
@@ -206,13 +212,74 @@ def tool_discover_schema() -> dict:
         lines.append(f"{table}({', '.join(parts)}) — {info['row_count']} rows")
         if info["sample_rows"]:
             lines.append(f"  e.g. {info['sample_rows'][0]}")
-    return {"schema_text": "\n".join(lines), "tables": list(schema.keys())}
+    # Append a CRITICAL reminder so the LLM reads the exact names
+    reminder = (
+        "\nCRITICAL: Use ONLY the EXACT column names shown above (case-sensitive, backtick-quoted). "
+        "Do NOT invent names like patient_name, billing_amount, etc. "
+        "The real names are listed above — copy them exactly."
+    )
+    schema_text = "\n".join(lines) + reminder
+    return {"schema_text": schema_text, "tables": list(schema.keys())}
+
+
+def _validate_sql_columns(sql: str) -> str | None:
+    """
+    Check SQL against _schema_cache for obviously wrong column names.
+    Returns an error string if bad names are found, else None.
+    Strip backticks/quotes for comparison; check against real column names
+    (case-insensitive to be lenient, but report the real casing).
+    """
+    if not _schema_cache:
+        return None  # schema not loaded yet — let the DB error naturally
+
+    import re as _re
+    # Collect all backtick-quoted or bare identifiers in the SQL
+    candidates = _re.findall(r"`([^`]+)`|\b([A-Za-z_][A-Za-z0-9_ ]*)\b", sql)
+    tokens = [a or b for a, b in candidates]
+
+    sql_keywords = {
+        "select","from","where","and","or","not","in","like","order","by","group",
+        "limit","offset","join","on","as","having","distinct","count","sum","avg",
+        "min","max","is","null","between","case","when","then","else","end","inner",
+        "left","right","outer","true","false","asc","desc","insert","update","delete"
+    }
+
+    bad = []
+    for table, real_cols in _schema_cache.items():
+        real_lower = {c.lower(): c for c in real_cols}
+        for tok in tokens:
+            tok_lower = tok.lower().strip()
+            if tok_lower in sql_keywords or tok_lower == table.lower():
+                continue
+            if len(tok_lower) < 2:
+                continue
+            # Flag if the token looks like a column reference but isn't in the schema
+            if tok_lower not in real_lower and "_" in tok_lower:
+                # snake_case token that doesn't exist → likely hallucinated
+                bad.append(tok)
+
+    if bad:
+        all_cols = []
+        for t, cols in _schema_cache.items():
+            all_cols.append(f"{t}: " + ", ".join(f"`{c}`" for c in cols))
+        return (
+            f"SQL contains column names that do not exist in the database: {bad}. "
+            f"Use ONLY these exact names (backtick-quoted): {'; '.join(all_cols)}. "
+            f"Rewrite the SQL with the correct column names."
+        )
+    return None
 
 
 def tool_query_database(sql: str) -> dict:
     """Execute a SQL SELECT query on the healthcare database."""
     if not Path(DB_PATH).exists():
         return {"success": False, "error": f"{DB_PATH} not found.", "data": []}
+
+    # Pre-flight column validation
+    col_error = _validate_sql_columns(sql)
+    if col_error:
+        return {"success": False, "error": col_error, "data": []}
+
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
@@ -225,7 +292,14 @@ def tool_query_database(sql: str) -> dict:
                     "data": [], "row_count": 0}
         return {"success": True, "data": [dict(r) for r in rows], "row_count": len(rows)}
     except Exception as e:
-        return {"success": False, "error": str(e), "data": []}
+        # Also include real column names in DB errors to help the LLM fix itself
+        hint = ""
+        if _schema_cache:
+            hint = " Real columns: " + "; ".join(
+                f"{t}({', '.join(f'`{c}`' for c in cols)})"
+                for t, cols in _schema_cache.items()
+            )
+        return {"success": False, "error": str(e) + hint, "data": []}
 
 
 def tool_search_documents(query: str) -> dict:
@@ -687,21 +761,28 @@ def _synthesise_answer(question: str, history: list[dict],
 
     context_block = "\n\n".join(parts)
 
+    # Show the LLM what data types are present so it knows what to use
+    source_note = []
+    if has_docs: source_note.append(f"{len(doc_chunks)} document chunk(s)")
+    if has_db:   source_note.append(f"{len(sql_results)} database row(s)")
+    sources_present = " and ".join(source_note)
+
     prompt = (
         f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n"
         f"You are OptumRx Billing Agent.\n"
-        f"STRICT RULES — follow exactly:\n"
-        f"1. Answer ONLY using the CONTEXT PROVIDED BELOW. No outside knowledge.\n"
-        f"2. Do NOT add disclaimers, caveats, or hedging sentences after your answer.\n"
-        f"3. Cite claims inline as (filename, page N) using the source tags in the context.\n"
-        f"4. EITHER answer fully from the context OR — if the context truly has nothing relevant — "
-        f"respond with only: 'I don't have that information in the provided documents. "
-        f"Please upload the relevant document or refine your question.' Do NOT do both.\n"
-        f"5. Never invent page numbers, filenames, policies, or statistics.\n"
-        f"6. Stop writing as soon as you have answered the question. No trailing sentences.\n"
+        f"You have been given REAL retrieved data ({sources_present}). "
+        f"You MUST use it to answer the question.\n\n"
+        f"RULES:\n"
+        f"1. Base your answer ENTIRELY on the CONTEXT section below.\n"
+        f"2. The context contains real data — you MUST use it. "
+           f"Do NOT say you lack information when context is provided.\n"
+        f"3. For document chunks: cite inline as (filename, page N).\n"
+        f"4. For database rows: summarise the key facts clearly.\n"
+        f"5. Do NOT add disclaimers or hedging sentences after answering.\n"
+        f"6. Stop as soon as the question is fully answered.\n"
         f"<|eot_id|><|start_header_id|>user<|end_header_id|>\n"
         f"Question: {question}\n\n"
-        f"CONTEXT:\n{context_block}\n"
+        f"CONTEXT ({sources_present}):\n{context_block}\n"
         f"<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
     )
     return call_llm(prompt, max_tokens=ANSWER_MAX_TOKENS)
@@ -726,6 +807,99 @@ def _summarise_result(tool_name: str, result: dict) -> str:
             return f"Retrieved **{n}** chunk(s) from: {', '.join(f'`{s}`' for s in sources)}"
         return result.get("message", "No chunks found.")
     return json.dumps(result)[:200]
+
+
+# ── Helper: render one assistant turn (steps + answer + tables) ──────────────
+def render_assistant_turn(final: dict, msg_index: int):
+    """Render all tool steps and the final answer for one assistant turn."""
+    # Tool steps — always shown, collapsed by default
+    for step in final.get("steps", []):
+        with st.expander(step["step"], expanded=False):
+            if step.get("detail"):
+                st.markdown(step["detail"])
+            if step.get("sql"):
+                st.code(step["sql"], language="sql")
+
+            raw = step.get("raw_result", {})
+
+            if step.get("tool_name") == "recall_memory" and raw.get("turns"):
+                for t in raw["turns"]:
+                    prefix = "🧑 User" if t["role"] == "user" else "🤖 Assistant"
+                    st.caption(f"{prefix}: {t['content'][:200]}")
+
+            if step.get("tool_name") == "discover_schema" and raw.get("schema_text"):
+                st.code(raw["schema_text"], language="text")
+
+            if step.get("tool_name") == "query_database" and raw.get("data"):
+                st.dataframe(pd.DataFrame(raw["data"][:5]),
+                             use_container_width=True, hide_index=True)
+
+            if step.get("tool_name") == "search_documents" and raw.get("chunks"):
+                for c in raw["chunks"]:
+                    score = c.get("rerank_score", c.get("score", "?"))
+                    st.markdown(f"**📄 {c['filename']} — p.{c['page_num']}** (score: {score})")
+                    st.caption(c["text"][:250] + ("…" if len(c["text"]) > 250 else ""))
+
+    # Tools-used badge
+    used = final.get("used_tools", [])
+    if used:
+        badges = " ".join(
+            f'`{TOOL_REGISTRY[t]["emoji"]} {t}`'
+            for t in dict.fromkeys(used)
+            if t in TOOL_REGISTRY
+        )
+        st.caption(f"Tools used: {badges}")
+
+    # Answer
+    answer = final.get("answer", "")
+    st.subheader("💬 Answer")
+    st.markdown(answer)
+
+    # Document citations
+    chunks = final.get("doc_chunks", [])
+    if chunks:
+        st.divider()
+        st.subheader("📎 Document Sources")
+        for i, c in enumerate(chunks, 1):
+            score = c.get("rerank_score", c.get("score", "?"))
+            with st.expander(
+                f"{i}. {c['filename']} — Page {c['page_num']}  (relevance: {score})",
+                expanded=False,
+            ):
+                st.markdown(c["text"])
+
+    # Database results
+    rows = final.get("sql_results", [])
+    if rows:
+        st.divider()
+        st.subheader("📋 Database Results")
+        df = pd.DataFrame(rows)
+        m = st.columns(4)
+        m[0].metric("Rows", len(rows))
+        if "billed" in df.columns:
+            m[1].metric("Total Billed", f"${df['billed'].sum():,.2f}")
+        if "administered" in df.columns:
+            m[2].metric("Total Administered", f"${df['administered'].sum():,.2f}")
+        if {"billed","administered"}.issubset(df.columns):
+            gap = df["billed"].sum() - df["administered"].sum()
+            m[3].metric("Billing Gap", f"${gap:,.2f}",
+                        delta=f"${gap:,.2f}", delta_color="inverse")
+        col_cfg = {}
+        for col in df.columns:
+            if col.lower() in ("billed","administered"):
+                col_cfg[col] = st.column_config.NumberColumn(
+                    col.replace("_"," ").title(), format="$%.2f")
+            elif "date" in col.lower():
+                col_cfg[col] = st.column_config.DateColumn(col.replace("_"," ").title())
+            else:
+                col_cfg[col] = st.column_config.TextColumn(col.replace("_"," ").title())
+        st.dataframe(df, use_container_width=True, hide_index=True, column_config=col_cfg)
+        num_cols = df.select_dtypes(include="number").columns.tolist()
+        if num_cols and len(df) > 1:
+            cc = st.selectbox("📈 Visualise:", num_cols, key=f"chart_{msg_index}")
+            lc = next((c for c in df.columns if "name" in c.lower()), None)
+            st.bar_chart(df.set_index(lc)[cc] if lc else df[cc])
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -846,9 +1020,13 @@ if st.session_state.suggestions:
             st.rerun()
 
 # ── Chat history ──────────────────────────────────────────────────────────────
-for msg in st.session_state.messages:
+for idx, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+        if msg["role"] == "assistant" and msg.get("final"):
+            # Replay full turn: tool steps + answer + tables
+            render_assistant_turn(msg["final"], idx)
+        else:
+            st.markdown(msg["content"])
 
 # ── Input ─────────────────────────────────────────────────────────────────────
 typed      = st.chat_input("Ask anything about billing, documents, or say hello…")
@@ -865,62 +1043,59 @@ if user_input:
         st.markdown(user_input)
 
     with st.chat_message("assistant"):
+        collected_steps = []
         final = None
 
-        # ── Stream A2T steps ──────────────────────────────────────────────────
+        # ── Stream & render steps live ────────────────────────────────────────
         for step in run_agent(user_input):
             if step.get("final"):
                 final = step
                 break
 
+            # Render live
             with st.expander(step["step"], expanded=False):
                 if step.get("detail"):
                     st.markdown(step["detail"])
                 if step.get("sql"):
                     st.code(step["sql"], language="sql")
-
                 raw = step.get("raw_result", {})
-
-                # Memory turns
                 if step.get("tool_name") == "recall_memory" and raw.get("turns"):
                     for t in raw["turns"]:
                         prefix = "🧑 User" if t["role"] == "user" else "🤖 Assistant"
                         st.caption(f"{prefix}: {t['content'][:200]}")
-
-                # Schema
                 if step.get("tool_name") == "discover_schema" and raw.get("schema_text"):
                     st.code(raw["schema_text"], language="text")
-
-                # DB rows preview
                 if step.get("tool_name") == "query_database" and raw.get("data"):
                     st.dataframe(pd.DataFrame(raw["data"][:5]),
                                  use_container_width=True, hide_index=True)
-
-                # Doc chunks preview
                 if step.get("tool_name") == "search_documents" and raw.get("chunks"):
                     for c in raw["chunks"]:
                         score = c.get("rerank_score", c.get("score", "?"))
                         st.markdown(f"**📄 {c['filename']} — p.{c['page_num']}** (score: {score})")
                         st.caption(c["text"][:250] + ("…" if len(c["text"]) > 250 else ""))
 
-        # ── Final render ──────────────────────────────────────────────────────
-        if final:
-            answer = final.get("answer", "")
+            # Save step for persistence
+            collected_steps.append(step)
 
-            # Tools used badge line
+        # ── Render final answer ───────────────────────────────────────────────
+        if final:
+            final["steps"] = collected_steps   # attach steps to the final payload
+
+            # Tools-used badge
             used = final.get("used_tools", [])
             if used:
                 badges = " ".join(
                     f'`{TOOL_REGISTRY[t]["emoji"]} {t}`'
-                    for t in dict.fromkeys(used)   # deduplicated, order-preserved
+                    for t in dict.fromkeys(used)
                     if t in TOOL_REGISTRY
                 )
                 st.caption(f"Tools used: {badges}")
 
+            answer = final.get("answer", "")
             st.subheader("💬 Answer")
             st.markdown(answer)
 
-            # ── Document citations ────────────────────────────────────────────
+            # Document citations
             chunks = final.get("doc_chunks", [])
             if chunks:
                 st.divider()
@@ -933,13 +1108,12 @@ if user_input:
                     ):
                         st.markdown(c["text"])
 
-            # ── Database results ──────────────────────────────────────────────
+            # Database results
             rows = final.get("sql_results", [])
             if rows:
                 st.divider()
                 st.subheader("📋 Database Results")
                 df = pd.DataFrame(rows)
-
                 m = st.columns(4)
                 m[0].metric("Rows", len(rows))
                 if "billed" in df.columns:
@@ -950,7 +1124,6 @@ if user_input:
                     gap = df["billed"].sum() - df["administered"].sum()
                     m[3].metric("Billing Gap", f"${gap:,.2f}",
                                 delta=f"${gap:,.2f}", delta_color="inverse")
-
                 col_cfg = {}
                 for col in df.columns:
                     if col.lower() in ("billed","administered"):
@@ -960,9 +1133,7 @@ if user_input:
                         col_cfg[col] = st.column_config.DateColumn(col.replace("_"," ").title())
                     else:
                         col_cfg[col] = st.column_config.TextColumn(col.replace("_"," ").title())
-
                 st.dataframe(df, use_container_width=True, hide_index=True, column_config=col_cfg)
-
                 num_cols = df.select_dtypes(include="number").columns.tolist()
                 if num_cols and len(df) > 1:
                     cc = st.selectbox("📈 Visualise:", num_cols,
@@ -970,9 +1141,14 @@ if user_input:
                     lc = next((c for c in df.columns if "name" in c.lower()), None)
                     st.bar_chart(df.set_index(lc)[cc] if lc else df[cc])
 
-            # ── Save to memory & set suggestions ─────────────────────────────
+            # ── Persist to session state ──────────────────────────────────────
             save_turn("assistant", answer)
-            st.session_state.messages.append({"role": "assistant", "content": answer})
+            # Store full final payload (with steps) so reruns can replay it
+            st.session_state.messages.append({
+                "role":    "assistant",
+                "content": answer,
+                "final":   final,          # ← steps + chunks + sql_results all here
+            })
             st.session_state.suggestions = final.get("suggestions", [])
             if st.session_state.suggestions:
                 st.rerun()
