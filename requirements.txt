@@ -1,0 +1,7 @@
+streamlit
+pandas
+google-genai
+chromadb
+sentence-transformers
+pypdf
+requests
